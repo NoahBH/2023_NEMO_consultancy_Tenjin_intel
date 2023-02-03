@@ -1,0 +1,202 @@
+---
+title: "Data Pipeline"
+author: "Noah Hatakeyama, Bryan Axel van Dongen, Hoyeon Won"
+date: "2023-02-03"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# IMPORT PACKAGES
+
+```{r}
+# install package 
+needed <- c("tenjin", "lubridate", "tidyverse", "data.table", "scales", "ggpubr", "ggrepel", "magrittr")
+
+new_packages <- needed[!(needed %in% installed.packages()[,"Package"])]
+if (length(new_packages)) {
+  devtools::install_github("NoahBH/2023_NEMO_consultancy_Tenjin_intel/tenjin")
+  install.packages(new_packages)
+}
+
+
+library(tenjin)
+library(lubridate)
+library(tidyverse)
+library(data.table)
+library(scales)
+library(ggpubr)
+library(ggrepel)
+library(magrittr)
+```
+
+
+
+# READ DATA
+
+```{r}
+setwd("~/Documents/iddc_bds_R/tenjin_intel_iddc/")
+data <- read_csv("datapoint_all_experiments.csv")
+tablet <- read.csv("tablet_positions.csv", sep=";")
+task <- read_csv("person_tasks.csv")
+
+### Initial data cleaning
+# change variable type from chr to datetime
+data_clean <- data %>%
+  mutate(timestamp = ymd_hms(timestamp),
+         
+         # create a date variable
+         date = floor_date(timestamp, unit="day")) %>%
+  
+  # remove October 18 as stipulated by client
+  filter(date != ymd("2022-10-18")) %>%
+  
+  # remove unnecessary variables
+  select(-date)
+
+
+# change variable type of datetime
+task <- task %>%
+  
+  # change variable type from chr to datetime
+  mutate_if(is.character, ymd_hms) %>%
+  
+  # MANUALLY CHANGING TIMEZONES due to the server error reported by client
+  mutate(start_time = start_time - hours(2),
+         end_time = end_time - hours(2))
+
+# change variable type from chr to logical
+tablet <- tablet %>%
+  mutate(starting_point = starting_point!="f") %>%
+  
+  # add centre tablet to the data
+  add_row(tablet_id = 10, starting_point = F, x = 3.33, y = 3.97)
+```
+
+
+
+# CREATE NEW VARIABLES
+
+
+In this section, we show the functions created for the generation of new variables meant to help both for the Data Quality report, and future iterations of the NEMO experiment.
+
+
+## Kinesiological Variables
+
+The function below is designed to add derived speed and acceleration to the data object. It assumes that smoothing of these variable is preferred, and thus signal smoothing is automatically done using FFT. Using the argument `smooth`, one can set the _proportion of frequencies_ to keep in the signal (default is 10%).
+
+```{r}
+data_clean %<>% AddSpeed()
+head(data_clean)
+```
+
+## Infer Stationarity
+
+The function below infers stationarity using:
+
+* Speed information
+* Proximity to a tablet
+
+Heuristics are applied to the information above, and thus the tagging of data points as "stationary" involve some level of uncertainty. In order to give full control of this, there are two arguments:
+
+* `benchmark` requires either a function or a numerical value, with which to infer slow speed. The default is `mean()` and thus speeds lower than average are flagged as slow.
+* `b` is the minimum Euclidean distance necessary to be flagged as near a tablet. The default is 1 meter.
+
+
+```{r}
+data_clean %<>% IsStationary(tablet)
+head(data_clean)
+```
+
+
+# INVESTIGATE NOISE PATTERNS
+
+## Extra Precautions to Recognise if an individual is at a tablet location
+
+Although in some situations Euclidean distance from the tablets suffice, this section was added to allow for even stricter filtering of the data.
+
+In addition to the Euclidean distance, we compute the angle (radians) and compare this to the angle of the tablets. This only makes sense if the origin is at the centre tablet (i.e. x = 3.33, y = 3.97).
+
+Therefore, `ChangeCoordinate()` below translates all coordinates in accordance to the new origin provided.
+
+
+```{r}
+# coordinate of the central sticker provided as origin
+data_stringent <- ChangeCoordinate(data_clean, c(3.33, 3.97))
+tablet %<>% ChangeCoordinate(c(3.33, 3.97))
+```
+
+
+Then, `LocationCosine()` can be used to compute the orientation of given coordinates compared to the basis vector $\hat{j}=(0,1)$.
+
+
+```{r}
+data_stringent %<>% LocationCosine()
+tablet %<>% LocationCosine()
+head(data_stringent)
+```
+
+
+Finally, the function below checks which tablet the position is closest to in terms of angle, given that the given coordinate is flagged as stationary.
+
+
+```{r}
+data_stringent %<>% TowardsTablet(tablet)
+head(data_stringent)
+```
+
+
+## Deviance from the mean position when stationary
+
+All of the process above was in order to get a measure of the noise when someone is stationary at a given tablet. `StationaryDeviance()` computes this for us.
+
+
+```{r}
+data_stringent %<>% StationaryDeviance(tablet)
+data_clean %<>% StationaryDeviance(tablet)
+```
+
+# MISSSING DATA DETECTION
+
+Here we interpolate the missing data in three steps.
+First identification of missing data.
+Second identification of previous or next location.
+Third linear interpolation conform Julia Anten's master thesis.
+
+Two things two are the exception handling for 
+difference larger than 2 seconds with gets assigned NA.
+
+
+```{r}
+data_clean  <- data_clean %>%
+  mutate(timestamp = as.character(timestamp)) %>%
+  Interpolate(.$person_id, .)
+
+data_stringent <-  data_stringent %>%
+  mutate(timestamp = as.character(timestamp)) %>%
+  Interpolate(.$person_id, .)
+```
+
+
+# MERGING DATA
+
+A simple function to loop the interpolation over all raw data.
+In the second step summarise it.
+In the third add the goals(tablet to and tablet from) this is achieved by comparison and multiple for loops.
+
+Function which loops over each ID, first interpolating data, then summarising it, adding the goals for participants. If verbose = TRUE then after each ID is processed it will give the maximum time jump and mean time jump for that given ID.
+
+```{r}
+CompleteData(unique(data_clean$person_id), task_df=task, data_clean) %>%
+  write_csv("datapoint_all_experiments_processed.csv")
+CompleteData(unique(data_stringent$person_id), task_df=task, data_stringent) %>%
+  write_csv("datapoint_all_experiments_processed_stringent.csv")
+```
+
+
+
+

@@ -1,0 +1,473 @@
+---
+title: "Data Quality Report"
+author: "Noah Hatakeyama (12520233), Bryan Axel van Dongen(13626426), Ho Yeon Won(12546496)"
+date: "2023-02-03"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| **SITUATION**    | Science versus Corona has means to create pedestrian models to simulate individual movement and crowd behavior by:                                                                                                  |
+|                  |                                                                                                                                                                                                                     |
+|                  | -   Assembling a mobile real-time locating system (RTLS) that allows gathering movement data (XY-coordinates) in real-time                                                                                          |
+|                  |                                                                                                                                                                                                                     |
+|                  | -   Acquiring at a frequency of up to 8 Hz and used as input for the M4MA model                                                                                                                                     |
+|                  |                                                                                                                                                                                                                     |
+|                  | -   Gathering 8 Hz data in a range of settings where agents move around to complete different goals                                                                                                                 |
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| **COMPLICATION** | -   They have optimized the system by using KINEXON system, which they are not sure of the quality of the data                                                                                                      |
+|                  | -   The recorded data had missing data points -- indicating an issue with the recording setup                                                                                                                       |
+|                  |     -   Missing data may contain (an)isotropic noise                                                                                                                                                                |
+|                  |                                                                                                                                                                                                                     |
+|                  |     -   Potential issues for causing the noise or systematic errors are unknown                                                                                                                                     |
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| **REQUEST**      | 1.  The clients want to know the quality of the data and the potential impact of systematic distortions, signal drop-out, and measurement noise.                                                                    |
+|                  | 2.  They would like an analysis pipeline to investigate these potential quality issues and to provide a smoothed and interpolated location time series, which would be used to fit a model of \~2Hz step decisions. |
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+# Pre-processing
+
+Installation of packages and processing data
+
+```{r}
+suppressMessages(library(lubridate))
+suppressMessages(library(tidyverse))
+suppressMessages(library(data.table))
+suppressMessages(library(scales))
+suppressMessages(library(ggpubr))
+suppressMessages(library(ggrepel))
+suppressMessages(library(magrittr))
+```
+
+
+```{r}
+# keep time digits
+op <- options(digits.secs = 6)
+original_data <- read_csv("datapoint_all_experiments.csv")
+processed_data <- read_csv("datapoint_all_experiments_processed.csv")
+tablet <- read.csv("tablet_positions.csv", sep=";") %>%
+  
+  # add centre tablet to the data
+  add_row(tablet_id = 10, starting_point = "f", x = 3.33, y = 3.97)
+task <- read_csv("person_tasks.csv")
+```
+
+# 1. Data Quality Diagnostic
+
+Keep in mind that a missing data point is defined as a 0.5 second (500 ms) time frame in which a tag has no recorded x and y coordinates. The data quality will be diagnosed in three steps:
+
+1.  Number of data points per second -- Based on the information we received, the data contains 8 data points per second (4 points per 500 ms)
+2.  Tag ID x Person ID Interaction -- mean seconds per data point
+3.  Missing data in Tag ID x Person ID
+
+## Data points & Hz Analyses
+
+Create data frames to fit the purpose of analysis
+
+```{r}
+# remove 2022-10-18 data
+original_data2 <- original_data %>%
+  mutate(timestamp = ymd_hms(timestamp),
+         
+         # create a date variable
+         date = floor_date(timestamp, unit="day")) %>%
+  
+  # remove October 18 as stipulated by client
+  filter(date != ymd("2022-10-18"))
+# three data frames for different purposes
+## main df group by tag_id, person_id, experiment_id
+interact_df <- original_data2 %>%
+  group_by(tag_id, person_id, experiment_id) %>%
+  mutate(diff = ymd_hms(timestamp) - lag(ymd_hms(timestamp)))
+### filter difference larger than 0.5 as NA is 0.5 second time frame in which a tag has no recorded x and y coordinates
+NA_detect_df <- interact_df %>%
+  mutate(condition = ifelse(diff > 0.5, "NA", "Normal"))
+### for plots with summary
+summary_df <- interact_df %>%
+  drop_na() %>%
+  summarize(mean = mean(diff),
+            # for clearer display of numbers/ relative difference
+            mean_ms = mean(diff) * 100,
+            # for the skewd distribution
+            median = median(diff),
+            median_ms= median(diff) * 100)
+```
+
+Check at which Hz the data contains location data for all participants.
+
+```{r, fig.width = 15}
+# for positioning jitter points - no overlapping points
+pos <- position_jitter(h = 0.05, w = 0.3, seed = 2)
+mean_ms_interaction <- summary_df %>% 
+  ggplot() +
+  # normal points with jitter
+  geom_jitter(
+    data = filter(summary_df, median_ms < 25.13),
+    mapping = aes(x = 1, y = median_ms),
+    alpha = 0.5,
+    colour = "#878787",
+    size = 2,
+    position = pos
+  ) +
+  # highlight those points with high median ms 
+  geom_jitter(
+    data = filter(summary_df, median_ms > 25.2),
+    mapping = aes(x = 1, y = median_ms, fill = "darkred"),
+    shape = 21,
+    size = 2,
+    position = pos
+  ) +
+  # label tag x person id on those extraordinary points
+  geom_text_repel(
+    data = filter(summary_df, median_ms > 25.13),
+    mapping = aes(x = 1, y = median_ms, 
+                  label = paste("Tag", tag_id, "x Person", person_id)),
+    position = pos,
+    size = 5
+  ) +
+  labs(title = "Tag ID x Person ID Interaction",
+       subtitle = "Median Seconds Per Data Point",
+       y = "Median Seconds") +
+  scale_y_continuous(labels = function(x){paste0(x, " ms")}) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        text = element_text(size = 20),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+# save in pdf
+# ggsave("mean_ms_interaction.pdf", mean_ms_interaction, width = 15)
+mean_ms_interaction
+```
+
+## Missing Data
+
+Missing data is identified first in the data frame created above, and the below plots will display results of:
+
+1.  Overall NAs in the data,
+
+2.  NAs per Tag ID,
+
+3.  NAs per Experiment ID
+
+Showing what's the overall trend of NAs in the data.
+
+```{r, fig.width = 15}
+Overall_NA_p <- NA_detect_df %>%
+  drop_na() %>%
+  group_by(condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = prop.table(n) * 100) %>%
+  ggplot(aes(x = condition, y = per,
+             label = c(paste(round(per[1], 4), "%"), 
+                       paste(round(per[2], 4), "%")))) +
+  geom_col(color = "black",
+           fill = c("darkred", "darkblue")) +
+  geom_text(vjust = -0.5,
+            size = 3) +
+  labs(title = "Overall NA Percentage",
+       x = "Group", y = "Percentage") +
+  scale_y_continuous(labels = function(x){paste0(x, " %")}) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+# In general there doesn't seem to be that much missing data
+# NA percentage per Tag ID
+spec_NA_df <- NA_detect_df %>%
+  group_by(tag_id, condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = n/sum(n)) %>%
+  filter(condition == "NA") %>%
+  mutate(group = cut(per, breaks = c(-Inf, 0.000255, 0.000390, Inf),
+      c("Low", "Middle", "High")))
+Specific_tag_NA_p <- spec_NA_df %>%
+  ggplot(aes(x = reorder(as.factor(tag_id), per), y = per, 
+             label = percent(per %>% round(4)))) +
+  geom_col(alpha = 0.7) +
+  geom_col(data = subset(spec_NA_df, group == "High"), fill = "darkred") +
+  geom_col(data = subset(spec_NA_df, per > 0.00065), 
+           fill = "darkred", color = "black", size = 1) +
+  geom_text(vjust = -0.5,    # nudge above top of bar
+              size = 3) +
+  geom_hline(aes(yintercept = mean(per)), color = "blue",
+             alpha = 0.5, linetype = "dashed") +
+  labs(title = "NA Percentage per Tag",
+       x = "Tag ID", y = "Percentage") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal() +
+  facet_grid(facets = . ~ group, scales = "free") +
+  theme(strip.text.x = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+spec_NA_df_exp <- NA_detect_df %>%
+  group_by(experiment_id, condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = n/sum(n)) %>%
+  filter(condition == "NA")
+Specific_exp_NA_p <- spec_NA_df_exp %>%
+  ggplot(aes(x = reorder(as.factor(experiment_id), per), y = per, 
+             label = percent(per %>% round(4)))) +
+  geom_col(alpha = 0.7) +
+  geom_col(data = subset(spec_NA_df_exp, per > mean(per)),
+           fill = "darkred") +
+  geom_col(data = subset(spec_NA_df_exp, experiment_id == 16),
+           fill = "darkred", color = "black", size = 1) + 
+  geom_text(vjust = -0.5,    # nudge above top of bar
+              size = 3) +
+  geom_hline(aes(yintercept = mean(per)), color = "blue",
+             alpha = 0.5, linetype = "dashed") +
+  labs(title = "NA Percentage per Experiment",
+       x = "Experiment ID", y = "Percentage") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+#ggsave("Overall_NA_p.pdf", Overall_NA_p, width = 15)
+#ggsave("Specific_tag_NA_p.pdf", Specific_tag_NA_p, width = 15)
+#ggsave("Specific_exp_NA_p.pdf", Specific_exp_NA_p, width = 15)
+Overall_NA_p
+Specific_tag_NA_p
+Specific_exp_NA_p
+```
+
+Short summary: Only 0.04% of the data are NAs, where no specific trend can be found within tag ID or experiment ID. Only some seem to be more concerning than others (Tag ID: 9, 55, 57).
+
+The next plots introduce the interaction between:
+
+1.  Tag ID x Person ID
+2.  Top NAs in Tag ID x Person ID
+
+on NA Percentage in the data.
+
+```{r, fig.width = 15}
+# Investigate on tag x person
+## dataframe for specific conditions
+spec_interact_detect_df <- NA_detect_df %>%
+  group_by(tag_id, person_id, condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = n/sum(n)) %>%
+  filter(condition == "NA") %>%
+  ungroup()
+tag_person_p <- spec_interact_detect_df %>%
+  arrange(per) %>%
+  mutate(Color = ifelse(per < mean(per), "grey", "darkred")) %>%
+  ggplot(aes(x = 1:length(per), y = per, color = Color)) +
+  geom_col() +
+  geom_hline(aes(yintercept = mean(per)), color = "blue",
+             linetype = "dashed") +
+  scale_color_identity() +
+  labs(title = "NA Percentage per Tag x Person",
+       y = "Percentage") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  
+## Plot
+top_tag_person_p <- spec_interact_detect_df %>%
+  ungroup() %>%
+  top_n(n = 20, per) %>%
+  ggplot(aes(x = reorder(as.factor(person_id), per), y = per,
+             label = paste("Tag", tag_id))) +
+               # label = percent(per %>% round(4)))) +
+  geom_col() +
+  geom_col(data = subset(spec_interact_detect_df, per > 0.01),
+           fill = "darkred") +
+  geom_text(vjust = -0.5,    # nudge above top of bar
+              size = 3) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Top 20 NA Percentage per Tag x Person",
+       x = "Person ID", y = "Percentage") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+#ggsave("tag_person_p.pdf", tag_person_p, width = 15)
+#ggsave("top_tag_person_p.pdf", top_tag_person_p, width = 15)
+tag_person_p
+top_tag_person_p
+spec_interact_detect_df %>%
+  filter(per > mean(per)) %>%
+  count(tag_id)
+```
+
+When investigating the top few person ID based on the results we saw before: that have higher NA percentage than the average, we can notice that Tag 9 do seem to recur a lot. The last table shows Tag 9 has occurred for 9 times, and other tags occur around 1 - 3 times in average. Keep in mind that person ID 378, 263, and 655 have the most NAs here.
+
+Additional exploration with experiment ID x person ID
+
+```{r, fig.width = 15}
+exp_NA_detect_df <- NA_detect_df %>%
+  group_by(experiment_id, person_id, condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = n/sum(n)) %>%
+  filter(condition == "NA") %>%
+  ungroup() %>%
+  top_n(20, per)
+exp_person_p <- exp_NA_detect_df %>%
+  ggplot(aes(x = reorder(as.factor(person_id), per), y = per,
+             label = paste("Exp", experiment_id))) +
+  geom_col() +
+  geom_col(data = subset(exp_NA_detect_df, per > mean(per)),
+           fill = "darkred") +
+  geom_text(vjust = -0.5,    # nudge above top of bar
+              size = 3) +
+  guides(fill = guide_legend(title = "Experiment ID")) +
+  labs(title = "NA Percentage per Experiment x Person",
+       x = "Experiment ID", y = "Percentage") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+# ggsave("exp_person_p.pdf", exp_person_p, width = 15)
+exp_person_p
+```
+
+When exploring the data with experiment x person ID, same person ID (person ID 378, 263, and 655) can be found to be the ones that have highest NA percentage.
+
+Next, we explore the Tag ID & Person ID counts to see how many NAs we can expect per certain amount of data points.
+
+```{r, fig.width = 15}
+counts_NA_p <- NA_detect_df %>%
+  drop_na() %>%
+  group_by(tag_id, condition) %>%
+  summarize(n = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(as.factor(tag_id), n), y = n, fill = condition,
+             label = paste(ifelse(condition == "NA", n, "")))) +
+  geom_col(position = "stack") +
+  geom_text(vjust = -0.5) +
+  scale_fill_manual(values = c("darkred", "lightgrey")) +
+  guides(fill = guide_legend(title = "Condition")) +
+  labs(title = "Number of Data points in Each Tag ID",
+       x = "Tag ID", y = "Counts") +
+  theme_minimal() +
+  theme(legend.position = "top",
+        plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20))
+person_counts_NA_p <- NA_detect_df %>%
+  drop_na() %>%
+  group_by(person_id, condition) %>%
+  summarize(n = n()) %>%
+  mutate(per = prop.table(n) * 100) %>%
+  filter(condition == "NA") %>%
+  ungroup() %>%
+  arrange(n) %>%
+  top_n(50, n) %>%
+  ggplot(aes(x = 1:length(n), y = n, fill = condition,
+             label = n)) +
+  geom_col(fill = "darkred") +
+  geom_text(vjust = -0.5) +
+  labs(title = "Number of NA Data points in Person",
+       y = "Counts") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 20),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+#ggsave("counts_NA_p.pdf", counts_NA_p, width = 15)
+#ggsave("person_counts_NA_p.pdf", person_counts_NA_p, width = 15)
+# summary of counts
+NA_detect_df %>%
+  drop_na() %>%
+  group_by(person_id, condition) %>%
+  summarize(n = n()) %>%
+  split(.$condition) %>%
+  map(summary)
+counts_NA_p
+person_counts_NA_p
+```
+
+The summary table shows we can expect around 2.4 missing data points per 3237 data points. The NAs seem to be increasing as the size of the total amount of data increases. You can expect around 0.04 to 0.07 % NAs in the data.
+
+
+## Noise analysis
+
+### Density plots
+
+Below, we create a plot of the deviance in location when people are assumed to be stationary for each tablet location.
+
+As it can be seen from the plots of the location deviance, the pattern of noise differ per tablet location.  Although warping of space towards the centre was expected, through visual inspection it seems that warping mainly occurs at the top left (tablet IDs 2, 3) and bottom right corners (tablet IDs 6, 7, 8) of the field.
+
+
+
+```{r}
+# Change the tablet positions to be comparable to the deviance data
+plot_data <- read_csv("/Users/noahhatakeyama/Documents/iddc_bds_R/tenjin_intel_iddc/data-for-report.csv")
+
+tab_deviance <- read_csv("data-for-report.csv") %>%
+  group_by(at_tablet_id) %>%
+  summarise(mu_y=mean(y), mu_x=mean(x)) %>%
+  left_join(tablet, by=c("at_tablet_id" = "tablet_id")) %>%
+  mutate(deviance_x = x - mu_x,
+         deviance_y = y - mu_y)
+
+# plot for each tablet
+for (i in 1:8) {
+  
+  t <- tab_deviance %>%
+    filter(at_tablet_id == i)
+
+  g <- plot_data %>%
+    filter(at_tablet_id == i) %>%
+    ggplot(aes(deviance_x, deviance_y)) +
+    geom_hex() +
+    geom_point(data=t, shape=8, color="pink", size=10) +
+    scale_fill_continuous(type = "viridis") +
+    ggtitle(paste("Tablet", i)) +
+    theme(axis.title.x = element_text("")) +
+    xlab("x-deviance") + ylab("y-deviance") +
+    guides(fill=guide_colorbar(title="Count")) +
+    theme(plot.title = element_text(hjust = 0.5, size = 25),
+          axis.title = element_text(size = 15))
+
+  plot(g)
+  
+  # save each plots
+  ggsave(paste0("Tablet", i, ".png"), g, width = 10, height = 9)
+}
+```
+
+
+### Correlation between deviance in x and y
+
+Below, the correlation between the deviance in x and y is computed. It is visible that all correlation coefficients are significant. This is expected given that the sample size is very large.
+
+Interestingly, all but one coefficient is around 0. Data at tablet 6 has a correlation of 0.5. This could also be due to the fact that tablet 6 is on the trajectory to the central point from tablet 9. This is further supported by the fact that there are many data points behind the tablet.
+
+
+```{r}
+cor_res <- plot_data %>%
+  group_by(at_tablet_id) %>%
+  group_split() %>%
+  lapply(function(x) list(x$at_tablet_id[1], cor.test(x$deviance_x, x$deviance_y)))
+
+cor_res
+```
+
+
+# Final Recommendations
+
+The pattern of missing data was largely consistent across persons. Therefore, random measurement error of 0.04% can be expected for future similar setups.
+
+The analysis of noise was based on heuristics. It would greatly benefit from a few _ground-truth data points_. Meaning a precise location where it is known that an individual is stationary at some given time, to increase the robustness of any conclusions.
+
+Since problems seem to surge at the extremities of the field, increasing the distance of the anchors to create a larger field and collection the majority of the data in the centre could increase the quality of the data.
+
+Additionally, the clients can set up stickers or makrs on the floor for each tablet location, so that children can be aware of the exact location to stand or wait in. This will increase precision in location data. 
+
+
+
